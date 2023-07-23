@@ -152,10 +152,6 @@ RUN \
 
 FROM build-layer AS bundle-install
 
-# Download and cache gems without "installing" them
-#
-# By splitting "cache" from "install" we can avoid [Could not find $GEM_NAME in cached gems or installed locally]
-#
 # NOTE: Instead of copying Gemfile and Gemfile.lock, we bind them to the container at build time
 # this avoids the issue of the files "changing" (e.g. a newline) invalidating the cache,
 # even though the "parsed" content is the same, and makes the file read-only and immutable
@@ -165,16 +161,12 @@ RUN \
   --mount=type=bind,source=Gemfile,target=Gemfile \
   --mount=type=bind,source=Gemfile.lock,target=Gemfile.lock \
   bundle config set --local without 'development test' && \
-  bundle config set silence_root_warning 'true' && \
-  bundle cache --no-install
-
-# Install gems from the cache above
-RUN \
-  # --mount=type=cache,target=/opt/mastodon/vendor/cache,id=bundle-cache-${TARGETPLATFORM} \
-  --mount=type=bind,source=Gemfile,target=Gemfile \
-  --mount=type=bind,source=Gemfile.lock,target=Gemfile.lock \
   bundle config set --local deployment 'true' && \
-  bundle install --local
+  bundle config set silence_root_warning 'true' && \
+  bundle install && \
+  bundle clean
+
+
 
 ##########################################################################################
 # Yarn cache + install layer
@@ -200,7 +192,7 @@ RUN \
 # Runtime layer, this is the output layer that the end-user will use
 ##########################################################################################
 
-FROM base-layer AS runtime-layer
+FROM base-layer AS runtime-base-layer
 
 # hadolint ignore=DL3008,DL3009
 RUN \
@@ -230,6 +222,8 @@ RUN ln -s /opt/mastodon /mastodon
 # Use the mastodon user from here on out
 USER mastodon
 
+FROM runtime-base-layer AS runtime-layer
+
 # [1/3] Copy the git source code into the image layer
 COPY --chown=mastodon:mastodon . /opt/mastodon
 
@@ -252,12 +246,51 @@ RUN \
   rails assets:precompile
 
 ##########################################################################################
+# Streaming server layer
+##########################################################################################
+
+FROM runtime-layer AS streaming-server
+
+# TODO: Add streaming server build process when https://github.com/mastodon/mastodon/pull/24702 is merged
+
+##########################################################################################
+# Cleanup layer
+##########################################################################################
+
+FROM runtime-base-layer AS cleanup-layer
+
+# [1/6] Copy the git source code into the image layer
+COPY --chown=mastodon:mastodon . /opt/mastodon
+
+# [2/6] Copy output of the "bundle install" build stage into this layer
+COPY --chown=mastodon:mastodon --from=bundle-install /opt/mastodon /opt/mastodon
+
+# [3/6] Copy output of the "assets:precompile" build stage into this layer
+COPY --chown=mastodon:mastodon --from=assets-precompile /opt/mastodon/public /opt/mastodon/public
+
+# [4/6] Copy output of the "streaming server" build stage into this layer
+COPY --chown=mastodon:mastodon --from=streaming-server /opt/mastodon/streaming /opt/mastodon/streaming
+
+# [5/6] Copy dependencies required by "streaming server"
+# TODO: This step can be removed hen https://github.com/mastodon/mastodon/pull/24702 is merged, to reduce image size by excluding `node_modules` required only for static assets
+COPY --chown=mastodon:mastodon --from=yarn-install /opt/mastodon/node_modules /opt/mastodon/node_modules
+
+# [5/6] Cleanup final image to reduce image size
+RUN  rm -rf app/assets vendor/assets lib/assets \
+       spec tmp/cache && \
+     find vendor/bundle/ruby/*/cache/ -name "*.gem" -delete && \
+     find vendor/bundle/ruby/*/       -name "*.log" -delete && \
+     find vendor/bundle/ruby/*/gems/  -name "*.c"   -delete && \
+     find vendor/bundle/ruby/*/gems/  -name "*.h"   -delete && \
+     find vendor/bundle/ruby/*/gems/  -name "*.o"   -delete
+
+##########################################################################################
 # Final layer
 ##########################################################################################
 
-FROM runtime-layer
+FROM runtime-base-layer
 
-COPY --chown=mastodon:mastodon --from=assets-precompile /opt/mastodon/public /opt/mastodon/public
+COPY --chown=mastodon:mastodon --from=cleanup-layer /opt/mastodon/ /opt/mastodon/
 
 # Set the work dir and the container entry point
 ENTRYPOINT ["/usr/bin/tini", "--"]
